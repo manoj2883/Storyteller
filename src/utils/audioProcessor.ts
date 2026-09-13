@@ -1,12 +1,13 @@
 /**
- * Audio Recording and Downsampling (16-bit PCM, 16kHz, Little-Endian)
- * and 24kHz PCM Audio Playback Engine for Gemini Live API
+ * Audio Recording, Downsampling (16-bit PCM, 16kHz, Little-Endian)
+ * Web Audio Analyser for Realtime Waveform, and 24kHz PCM Audio Playback
  */
 
 export class AudioRecorder {
   private audioContext: AudioContext | null = null;
   private mediaStream: MediaStream | null = null;
   private scriptProcessor: ScriptProcessorNode | null = null;
+  private analyser: AnalyserNode | null = null;
   private onAudioDataCallback: (base64Pcm: string) => void;
 
   constructor(onAudioData: (base64Pcm: string) => void) {
@@ -28,6 +29,12 @@ export class AudioRecorder {
     this.audioContext = new AudioContextClass();
 
     const source = this.audioContext.createMediaStreamSource(this.mediaStream);
+    
+    // Analyser node for visualizer waveform
+    this.analyser = this.audioContext.createAnalyser();
+    this.analyser.fftSize = 256;
+    source.connect(this.analyser);
+
     // Buffer size 2048, 1 input channel, 1 output channel
     this.scriptProcessor = this.audioContext.createScriptProcessor(2048, 1, 1);
 
@@ -47,10 +54,25 @@ export class AudioRecorder {
     this.scriptProcessor.connect(this.audioContext.destination);
   }
 
+  public getAudioLevel(): number {
+    if (!this.analyser) return 0;
+    const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+    this.analyser.getByteFrequencyData(dataArray);
+    let sum = 0;
+    for (let i = 0; i < dataArray.length; i++) {
+      sum += dataArray[i];
+    }
+    return Math.min(100, Math.round((sum / dataArray.length) * 1.5));
+  }
+
   public stop(): void {
     if (this.scriptProcessor) {
       this.scriptProcessor.disconnect();
       this.scriptProcessor = null;
+    }
+    if (this.analyser) {
+      this.analyser.disconnect();
+      this.analyser = null;
     }
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach((track) => track.stop());
@@ -117,7 +139,6 @@ export class AudioRecorder {
 export class PCM24Player {
   private audioContext: AudioContext | null = null;
   private nextStartTime: number = 0;
-  private isPlaying: boolean = false;
 
   constructor() {
     const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -138,14 +159,12 @@ export class PCM24Player {
         bytes[i] = binaryString.charCodeAt(i);
       }
 
-      // Convert 16-bit PCM to Float32 array
       const int16Array = new Int16Array(bytes.buffer);
       const float32Array = new Float32Array(int16Array.length);
       for (let i = 0; i < int16Array.length; i++) {
         float32Array[i] = int16Array[i] / 32768.0;
       }
 
-      // Create AudioBuffer at 24000 Hz
       const audioBuffer = this.audioContext.createBuffer(1, float32Array.length, 24000);
       audioBuffer.getChannelData(0).set(float32Array);
 
@@ -160,9 +179,8 @@ export class PCM24Player {
 
       source.start(this.nextStartTime);
       this.nextStartTime += audioBuffer.duration;
-      this.isPlaying = true;
     } catch (e) {
-      console.error('Error decoding/playing PCM audio chunk:', e);
+      console.error('Error decoding PCM audio chunk:', e);
     }
   }
 

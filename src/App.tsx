@@ -8,6 +8,7 @@ import { LiveModeHUD } from './components/LiveModeHUD';
 import { TeardownView } from './components/TeardownView';
 import { StoryBank } from './components/StoryBank';
 import { BitBank } from './components/BitBank';
+import { WaveformVisualizer } from './components/WaveformVisualizer';
 import { getAllStories, saveTeardown, getAllTeardowns } from './services/db';
 
 import {
@@ -25,20 +26,26 @@ import {
   Volume2,
   AlertOctagon,
   Flame,
+  Zap,
+  Gauge,
+  Tag,
+  Clock,
+  ShieldCheck,
 } from 'lucide-react';
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'storybank' | 'bitbank' | 'teardown'>('dashboard');
   const [sessionMode, setSessionMode] = useState<SessionMode>('rehearsal');
 
-  // Session state
+  // Session timer state
+  const [isSessionActive, setIsSessionActive] = useState<boolean>(false);
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [statusMessage, setStatusMessage] = useState<string>('Ready');
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
   const [chunkIndex, setChunkIndex] = useState<number>(1);
-  const [logs, setLogs] = useState<string[]>([]);
+  const [audioLevel, setAudioLevel] = useState<number>(0);
 
-  // Realtime metric snapshots & transcripts
+  // Metrics & transcript logs
   const [metrics, setMetrics] = useState<MetricSnapshot>({
     wpm15s: 0,
     fillerCount30s: 0,
@@ -53,7 +60,6 @@ export const App: React.FC = () => {
   const [activeTeardown, setActiveTeardown] = useState<TeardownReport | null>(null);
   const [activeFlatStretches, setActiveFlatStretches] = useState<FlatStretchWindow[]>([]);
   const [isGeneratingTeardown, setIsGeneratingTeardown] = useState<boolean>(false);
-  const [pastTeardowns, setPastTeardowns] = useState<TeardownReport[]>([]);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const liveStreamRef = useRef<LiveStreamService | null>(null);
@@ -65,23 +71,25 @@ export const App: React.FC = () => {
 
   // Load past teardowns on mount
   useEffect(() => {
-    getAllTeardowns().then(setPastTeardowns).catch(console.error);
+    getAllTeardowns().catch(console.error);
   }, []);
 
-  // Session timer
+  // Timer loop when session is active
   useEffect(() => {
-    if (status === 'connected' || status === 'chunking') {
+    if (isSessionActive) {
       timerRef.current = window.setInterval(() => {
         setElapsedSeconds((prev) => prev + 1);
       }, 1000);
 
-      // Periodically update metrics snapshot
       metricTimerRef.current = window.setInterval(() => {
         if (metricsEngineRef.current) {
           const snap = metricsEngineRef.current.getSnapshot();
           setMetrics(snap);
         }
-      }, 1000);
+        if (liveStreamRef.current) {
+          setAudioLevel(liveStreamRef.current.getAudioLevel());
+        }
+      }, 100);
     } else {
       if (timerRef.current) clearInterval(timerRef.current);
       if (metricTimerRef.current) clearInterval(metricTimerRef.current);
@@ -93,29 +101,22 @@ export const App: React.FC = () => {
       if (timerRef.current) clearInterval(timerRef.current);
       if (metricTimerRef.current) clearInterval(metricTimerRef.current);
     };
-  }, [status]);
-
-  const addLog = (msg: string) => {
-    const timeStr = new Date().toLocaleTimeString();
-    setLogs((prev) => [...prev, `[${timeStr}] ${msg}`]);
-  };
+  }, [isSessionActive]);
 
   const handleStartSession = async (mode: SessionMode) => {
     setSessionMode(mode);
     setTranscripts([]);
     setInterruptions([]);
     setActiveTeardown(null);
+    setElapsedSeconds(0);
+    setIsSessionActive(true);
     metricsEngineRef.current.reset();
 
-    // Rehearsal Engine setup
     if (mode === 'rehearsal') {
       rehearsalEngineRef.current = new RehearsalEngine((evt) => {
         setInterruptions((prev) => [...prev, evt]);
-        addLog(`[REHEARSAL INTERRUPTION #${evt.count}] ${evt.reason}${evt.isHostileAudienceTurn ? ' (Hostile Audience Switch!)' : ''}`);
       });
     }
-
-    addLog(`Starting ${mode.toUpperCase()} session...`);
 
     const service = new LiveStreamService({
       onStatusChange: (newStatus, msg) => {
@@ -138,11 +139,8 @@ export const App: React.FC = () => {
       },
       onChunkEvent: (idx, action) => {
         setChunkIndex(idx);
-        addLog(`Session Chunk #${idx} state: ${action}`);
       },
-      onLog: (logText) => {
-        addLog(logText);
-      },
+      onLog: () => {},
     });
 
     liveStreamRef.current = service;
@@ -150,6 +148,7 @@ export const App: React.FC = () => {
   };
 
   const handleStopSession = async () => {
+    setIsSessionActive(false);
     if (liveStreamRef.current) {
       liveStreamRef.current.endSession();
       liveStreamRef.current = null;
@@ -157,30 +156,25 @@ export const App: React.FC = () => {
 
     setStatus('disconnected');
     setStatusMessage('Session completed');
-    addLog('Session stopped. Running Retention Engine & Post-Session Teardown...');
-
     setIsGeneratingTeardown(true);
 
     try {
-      // 1. Run Pure Heuristic Retention Engine flat-stretch detection
       const transcriptEntries: TranscriptEntry[] = transcripts.map((t) => ({
         text: t.text,
         timestampSec: t.timestampSec,
       }));
 
-      const flatStretches = detectFlatStretches(transcriptEntries, elapsedSeconds);
+      const flatStretches = detectFlatStretches(transcriptEntries, elapsedSeconds || 30);
       setActiveFlatStretches(flatStretches);
 
-      // 2. Fetch Story Bank entries to provide context to Teardown
       const stories: Story[] = await getAllStories();
 
-      // 3. Call backend /api/teardown endpoint
       const response = await fetch('/api/teardown', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sessionId: 'sess_' + Date.now(),
-          durationSec: elapsedSeconds,
+          durationSec: elapsedSeconds || 30,
           mode: sessionMode,
           transcript: transcripts,
           metrics,
@@ -196,13 +190,9 @@ export const App: React.FC = () => {
       const teardownReport: TeardownReport = await response.json();
       await saveTeardown(teardownReport);
       setActiveTeardown(teardownReport);
-      setPastTeardowns((prev) => [teardownReport, ...prev]);
-
       setActiveTab('teardown');
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      addLog(`[Teardown Error] ${msg}`);
-      alert(`Teardown generation note: ${msg}`);
+      console.error('Teardown note:', err);
     } finally {
       setIsGeneratingTeardown(false);
     }
@@ -215,68 +205,72 @@ export const App: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen bg-dark-900 text-slate-100 flex flex-col font-sans">
+    <div className="min-h-screen bg-[#070A12] text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-black">
       {/* Top Navbar */}
-      <nav className="bg-dark-800/90 border-b border-slate-800 backdrop-blur-md sticky top-0 z-40">
+      <nav className="bg-slate-950/80 border-b border-slate-800/80 backdrop-blur-xl sticky top-0 z-40">
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-cyan-500 to-indigo-600 flex items-center justify-center font-bold text-white shadow-lg shadow-cyan-900/40">
+            <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-cyan-500 via-blue-600 to-indigo-600 flex items-center justify-center font-black text-white text-xl shadow-lg shadow-cyan-500/20 ring-1 ring-white/20">
               S
             </div>
             <div>
-              <span className="font-extrabold text-white text-lg tracking-tight">Storyteller</span>
-              <span className="text-[10px] text-cyan-400 font-semibold block leading-none">Live Communication Coach</span>
+              <span className="font-extrabold text-white text-lg tracking-tight flex items-center gap-2">
+                Storyteller
+                <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/30">
+                  Live AI Coach
+                </span>
+              </span>
             </div>
           </div>
 
-          {/* Navigation Tabs */}
-          <div className="flex items-center gap-1 bg-dark-900/80 p-1.5 rounded-xl border border-slate-800 text-xs">
+          {/* Nav Tabs */}
+          <div className="flex items-center gap-1.5 bg-slate-900/90 p-1.5 rounded-2xl border border-slate-800 text-xs shadow-inner">
             <button
               onClick={() => setActiveTab('dashboard')}
-              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg font-medium transition-all ${
+              className={`flex items-center gap-2 px-4 py-2 rounded-xl font-bold transition-all ${
                 activeTab === 'dashboard'
-                  ? 'bg-cyan-600 text-white shadow-md'
+                  ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-white shadow-lg shadow-cyan-900/40'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              <Activity className="w-3.5 h-3.5" />
-              Live & Rehearsal Studio
+              <Activity className="w-4 h-4" />
+              Live Studio
             </button>
 
             <button
               onClick={() => setActiveTab('storybank')}
-              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg font-medium transition-all ${
+              className={`flex items-center gap-2 px-4 py-2 rounded-xl font-bold transition-all ${
                 activeTab === 'storybank'
-                  ? 'bg-cyan-600 text-white shadow-md'
+                  ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-white shadow-lg shadow-cyan-900/40'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              <BookOpen className="w-3.5 h-3.5" />
+              <BookOpen className="w-4 h-4" />
               Story Bank
             </button>
 
             <button
               onClick={() => setActiveTab('bitbank')}
-              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg font-medium transition-all ${
+              className={`flex items-center gap-2 px-4 py-2 rounded-xl font-bold transition-all ${
                 activeTab === 'bitbank'
-                  ? 'bg-purple-600 text-white shadow-md'
+                  ? 'bg-gradient-to-r from-purple-500 to-indigo-600 text-white shadow-lg shadow-purple-900/40'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              <Smile className="w-3.5 h-3.5" />
+              <Smile className="w-4 h-4" />
               Bit Bank
             </button>
 
             {activeTeardown && (
               <button
                 onClick={() => setActiveTab('teardown')}
-                className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg font-medium transition-all ${
+                className={`flex items-center gap-2 px-4 py-2 rounded-xl font-bold transition-all ${
                   activeTab === 'teardown'
-                    ? 'bg-rose-600 text-white shadow-md'
+                    ? 'bg-gradient-to-r from-rose-500 to-orange-600 text-white shadow-lg shadow-rose-900/40'
                     : 'text-rose-400 hover:text-rose-300'
                 }`}
               >
-                <Award className="w-3.5 h-3.5" />
+                <Award className="w-4 h-4" />
                 Latest Teardown
               </button>
             )}
@@ -284,75 +278,84 @@ export const App: React.FC = () => {
         </div>
       </nav>
 
-      {/* Main Container */}
+      {/* Main Content Area */}
       <main className="flex-1">
-        {/* TAB 1: Live & Rehearsal Studio */}
         {activeTab === 'dashboard' && (
           <div className="max-w-7xl mx-auto p-6 space-y-6">
-            {/* Top Control Bar */}
-            <div className="bg-dark-800 p-5 rounded-2xl border border-slate-800 flex flex-col md:flex-row items-center justify-between gap-4">
-              <div className="flex items-center gap-3">
-                <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Select Mode:</span>
-                <button
-                  onClick={() => setSessionMode('live')}
-                  disabled={status !== 'disconnected'}
-                  className={`px-4 py-2 rounded-xl text-xs font-semibold border transition-all ${
-                    sessionMode === 'live'
-                      ? 'bg-amber-500/20 border-amber-500/50 text-amber-300 shadow-md'
-                      : 'bg-dark-700 border-transparent text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Live Mode (Silent Ambient HUD)
-                </button>
-                <button
-                  onClick={() => setSessionMode('rehearsal')}
-                  disabled={status !== 'disconnected'}
-                  className={`px-4 py-2 rounded-xl text-xs font-semibold border transition-all ${
-                    sessionMode === 'rehearsal'
-                      ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300 shadow-md'
-                      : 'bg-dark-700 border-transparent text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Rehearsal Mode (Active Interruptions)
-                </button>
+            {/* Header Control Panel */}
+            <div className="bg-slate-900/80 backdrop-blur-xl p-6 rounded-3xl border border-slate-800 shadow-2xl flex flex-col md:flex-row items-center justify-between gap-6">
+              {/* Mode Selection */}
+              <div className="space-y-2">
+                <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block">Mode Selection</span>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => setSessionMode('rehearsal')}
+                    disabled={isSessionActive}
+                    className={`flex items-center gap-2 px-5 py-3 rounded-2xl text-xs font-bold border transition-all ${
+                      sessionMode === 'rehearsal'
+                        ? 'bg-cyan-500/20 border-cyan-500/60 text-cyan-300 shadow-lg shadow-cyan-950/50 ring-2 ring-cyan-500/30'
+                        : 'bg-slate-800/60 border-slate-700/60 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <Volume2 className="w-4 h-4 text-cyan-400" />
+                    Rehearsal Mode (Live Interruption)
+                  </button>
+
+                  <button
+                    onClick={() => setSessionMode('live')}
+                    disabled={isSessionActive}
+                    className={`flex items-center gap-2 px-5 py-3 rounded-2xl text-xs font-bold border transition-all ${
+                      sessionMode === 'live'
+                        ? 'bg-amber-500/20 border-amber-500/60 text-amber-300 shadow-lg shadow-amber-950/50 ring-2 ring-amber-500/30'
+                        : 'bg-slate-800/60 border-slate-700/60 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <Radio className="w-4 h-4 text-amber-400" />
+                    Live Mode (Silent Ambient HUD)
+                  </button>
+                </div>
               </div>
 
-              <div className="flex items-center gap-4">
-                <div className="text-right">
-                  <div className="text-[10px] text-slate-400 uppercase font-semibold">Duration</div>
-                  <div className="text-xl font-mono font-extrabold text-white">{formatTime(elapsedSeconds)}</div>
+              {/* Timer & Controls */}
+              <div className="flex items-center gap-6">
+                <div className="text-right space-y-1">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest block">Elapsed Session Time</span>
+                  <div className="text-3xl font-mono font-black tracking-tight text-white flex items-center gap-2 justify-end">
+                    <Clock className={`w-5 h-5 ${isSessionActive ? 'text-emerald-400 animate-pulse' : 'text-slate-600'}`} />
+                    {formatTime(elapsedSeconds)}
+                  </div>
                 </div>
 
-                {status === 'disconnected' ? (
+                {!isSessionActive ? (
                   <button
                     onClick={() => handleStartSession(sessionMode)}
-                    className="flex items-center gap-2 bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white font-bold py-2.5 px-6 rounded-xl text-xs shadow-lg shadow-cyan-900/30 transition-all"
+                    className="flex items-center gap-2 bg-gradient-to-r from-cyan-500 via-blue-600 to-indigo-600 hover:from-cyan-400 hover:to-indigo-500 text-white font-extrabold py-3.5 px-8 rounded-2xl text-sm shadow-xl shadow-cyan-900/40 transition-all hover:scale-105 active:scale-95"
                   >
-                    <Play className="w-4 h-4 fill-current" />
-                    Start {sessionMode.toUpperCase()}
+                    <Play className="w-5 h-5 fill-current" />
+                    Start Session
                   </button>
                 ) : (
                   <button
                     onClick={handleStopSession}
                     disabled={isGeneratingTeardown}
-                    className="flex items-center gap-2 bg-rose-600 hover:bg-rose-500 text-white font-bold py-2.5 px-6 rounded-xl text-xs shadow-lg shadow-rose-900/30 transition-all"
+                    className="flex items-center gap-2 bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-500 hover:to-red-500 text-white font-extrabold py-3.5 px-8 rounded-2xl text-sm shadow-xl shadow-rose-950/60 transition-all hover:scale-105 active:scale-95"
                   >
                     {isGeneratingTeardown ? (
-                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      <RefreshCw className="w-5 h-5 animate-spin" />
                     ) : (
-                      <Square className="w-4 h-4 fill-current" />
+                      <Square className="w-5 h-5 fill-current" />
                     )}
-                    {isGeneratingTeardown ? 'Analyzing...' : 'End & Generate Teardown'}
+                    {isGeneratingTeardown ? 'Generating Teardown...' : 'End & View Teardown'}
                   </button>
                 )}
               </div>
             </div>
 
-            {/* Video Preview & Studio Grid */}
+            {/* Main Interactive Studio Grid */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-              {/* Camera & Rehearsal Interruption Tracker */}
-              <div className="lg:col-span-6 space-y-4">
-                <div className="bg-dark-800 rounded-2xl border border-slate-800 overflow-hidden relative group aspect-video">
+              {/* Left Column: Video Feed & Waveform & Rehearsal Tracker */}
+              <div className="lg:col-span-6 space-y-6">
+                <div className="bg-slate-900/90 rounded-3xl border border-slate-800 overflow-hidden relative aspect-video shadow-2xl group">
                   <video
                     ref={videoRef}
                     playsInline
@@ -360,58 +363,61 @@ export const App: React.FC = () => {
                     className="w-full h-full object-cover bg-slate-950"
                   />
 
-                  {/* Overlays */}
-                  <div className="absolute top-3 left-3 flex items-center gap-2">
-                    <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/60 backdrop-blur-md text-[11px] font-medium text-slate-200 border border-white/10">
-                      <Video className="w-3.5 h-3.5 text-cyan-400" />
-                      1 FPS Video
+                  {/* Top Overlay Badges */}
+                  <div className="absolute top-4 left-4 flex items-center gap-2.5">
+                    <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-black/70 backdrop-blur-md text-xs font-semibold text-slate-200 border border-white/10">
+                      <Video className="w-4 h-4 text-cyan-400" />
+                      1 FPS Frame Stream
                     </span>
-                    <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/60 backdrop-blur-md text-[11px] font-medium text-slate-200 border border-white/10">
-                      <Mic className="w-3.5 h-3.5 text-emerald-400" />
+                    <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-black/70 backdrop-blur-md text-xs font-semibold text-slate-200 border border-white/10">
+                      <Mic className="w-4 h-4 text-emerald-400" />
                       16kHz PCM
                     </span>
                   </div>
 
-                  {status === 'connected' && sessionMode === 'live' && (
-                    <div className="absolute top-3 right-3 px-3 py-1 rounded-full bg-amber-500/20 backdrop-blur-md border border-amber-500/40 text-amber-400 text-xs font-semibold flex items-center gap-1.5">
-                      <Radio className="w-3.5 h-3.5 animate-pulse" />
-                      Silent Ambient Mode (No Voice Output)
-                    </div>
-                  )}
+                  {/* Audio Waveform Equalizer */}
+                  <div className="absolute bottom-4 left-4">
+                    <WaveformVisualizer level={audioLevel} isActive={isSessionActive} />
+                  </div>
 
-                  {status === 'connected' && sessionMode === 'rehearsal' && (
-                    <div className="absolute top-3 right-3 px-3 py-1 rounded-full bg-cyan-500/20 backdrop-blur-md border border-cyan-500/40 text-cyan-400 text-xs font-semibold flex items-center gap-1.5">
-                      <Volume2 className="w-3.5 h-3.5 animate-pulse" />
-                      Rehearsal Coach Active
+                  {/* Active Status Badge */}
+                  {isSessionActive && (
+                    <div className="absolute bottom-4 right-4 px-3.5 py-1.5 rounded-xl bg-emerald-500/20 backdrop-blur-md border border-emerald-500/40 text-emerald-400 text-xs font-bold flex items-center gap-2 shadow-lg">
+                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping" />
+                      Session Live
                     </div>
                   )}
                 </div>
 
-                {/* Rehearsal Interruptions Box */}
+                {/* Rehearsal Mode Interruption Tracker */}
                 {sessionMode === 'rehearsal' && (
-                  <div className="bg-dark-800 p-4 rounded-2xl border border-slate-800 space-y-3">
-                    <div className="flex items-center justify-between border-b border-slate-700/60 pb-2">
-                      <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                  <div className="bg-slate-900/80 p-5 rounded-3xl border border-slate-800 space-y-3 shadow-xl">
+                    <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-2">
                         <AlertOctagon className="w-4 h-4 text-rose-400" />
-                        Rehearsal Interruption Tracker
+                        Rehearsal Interruption Log
                       </h3>
-                      <span className="text-xs font-bold text-rose-400">{interruptions.length} Interruptions</span>
+                      <span className="text-xs font-extrabold text-rose-400 bg-rose-500/10 px-2.5 py-1 rounded-full border border-rose-500/30">
+                        {interruptions.length} Interruptions
+                      </span>
                     </div>
 
-                    <div className="space-y-2 max-h-40 overflow-y-auto pr-2 text-xs">
+                    <div className="space-y-2 max-h-48 overflow-y-auto pr-2 text-xs">
                       {interruptions.length === 0 ? (
-                        <p className="text-slate-500 italic py-2">No interruptions triggered yet. Speak in rehearsal mode.</p>
+                        <p className="text-slate-500 italic py-4 text-center">
+                          No interruptions triggered yet. Speak in Rehearsal Mode to start reps.
+                        </p>
                       ) : (
                         interruptions.map((item, idx) => (
                           <div
                             key={idx}
-                            className={`p-2.5 rounded-lg border ${
+                            className={`p-3 rounded-xl border transition-all ${
                               item.isHostileAudienceTurn
                                 ? 'bg-purple-950/40 border-purple-700/50 text-purple-200'
                                 : 'bg-rose-950/40 border-rose-800/40 text-rose-200'
                             }`}
                           >
-                            <span className="font-bold mr-2 text-[10px] uppercase">
+                            <span className="font-bold mr-2 text-[10px] uppercase tracking-wider">
                               #{item.count} [{item.isHostileAudienceTurn ? 'HOSTILE AUDIENCE' : 'COACH INTERRUPT'}]:
                             </span>
                             {item.reason}
@@ -423,43 +429,53 @@ export const App: React.FC = () => {
                 )}
               </div>
 
-              {/* Right Column: Live Transcript Stream & Realtime Metrics */}
-              <div className="lg:col-span-6 space-y-4">
-                {/* Metrics Live Card */}
+              {/* Right Column: Real-Time Delivery Metrics & Live Transcript Stream */}
+              <div className="lg:col-span-6 space-y-6">
+                {/* Delivery Gauges */}
                 <div className="grid grid-cols-2 gap-4">
-                  <div className="bg-dark-800 p-4 rounded-xl border border-slate-800 space-y-1">
-                    <span className="text-[10px] text-slate-400 font-bold uppercase">Rolling Pace (15s Window)</span>
-                    <div className="text-2xl font-black text-white">{metrics.wpm15s} <span className="text-xs text-slate-500 font-normal">WPM</span></div>
-                    <div className="text-[11px] text-slate-400">Target Band: 120 - 160 WPM</div>
+                  <div className="bg-slate-900/80 p-5 rounded-3xl border border-slate-800 space-y-2 shadow-xl">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Rolling Pace (15s)</span>
+                      <Gauge className="w-4 h-4 text-cyan-400" />
+                    </div>
+                    <div className="text-3xl font-black text-white">{metrics.wpm15s} <span className="text-xs text-slate-500 font-normal">WPM</span></div>
+                    <div className="text-[11px] text-slate-400 flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-emerald-400" /> Target Band: 120 - 160 WPM
+                    </div>
                   </div>
 
-                  <div className="bg-dark-800 p-4 rounded-xl border border-slate-800 space-y-1">
-                    <span className="text-[10px] text-slate-400 font-bold uppercase">Filler Density (30s Window)</span>
-                    <div className="text-2xl font-black text-rose-400">{metrics.fillerCount30s} <span className="text-xs text-slate-500 font-normal">Fillers</span></div>
-                    <div className="text-[11px] text-slate-400">List: um, uh, like, you know, etc.</div>
+                  <div className="bg-slate-900/80 p-5 rounded-3xl border border-slate-800 space-y-2 shadow-xl">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Filler Words (30s)</span>
+                      <Zap className="w-4 h-4 text-rose-400" />
+                    </div>
+                    <div className="text-3xl font-black text-rose-400">{metrics.fillerCount30s} <span className="text-xs text-slate-500 font-normal">Fillers</span></div>
+                    <div className="text-[11px] text-slate-400">um, uh, like, you know, etc.</div>
                   </div>
                 </div>
 
-                {/* Transcript Stream */}
-                <div className="bg-dark-800 p-4 rounded-2xl border border-slate-800 h-96 flex flex-col">
-                  <div className="flex items-center justify-between pb-3 border-b border-slate-700/60">
-                    <span className="text-xs font-bold uppercase tracking-wider text-slate-400">Realtime Transcript Stream</span>
-                    <span className="text-xs text-slate-500">{transcripts.length} turns</span>
+                {/* Real-time Transcript Feed */}
+                <div className="bg-slate-900/80 p-5 rounded-3xl border border-slate-800 h-[380px] flex flex-col shadow-xl">
+                  <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+                    <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                      Live Transcript Stream
+                    </span>
+                    <span className="text-xs text-slate-500 font-mono">{transcripts.length} turns recorded</span>
                   </div>
 
-                  <div className="flex-1 overflow-y-auto mt-3 space-y-3 pr-2 text-xs">
+                  <div className="flex-1 overflow-y-auto mt-4 space-y-3 pr-2 text-xs">
                     {transcripts.length === 0 ? (
                       <div className="h-full flex items-center justify-center text-slate-500 italic">
-                        Start session and speak to capture live transcript turns...
+                        Start session and speak to see live transcript turns stream in real time...
                       </div>
                     ) : (
                       transcripts.map((t, idx) => (
                         <div
                           key={idx}
-                          className={`p-3 rounded-xl border ${
+                          className={`p-3.5 rounded-2xl border ${
                             t.speaker === 'coach'
                               ? 'bg-cyan-950/40 border-cyan-800/40 text-cyan-200'
-                              : 'bg-dark-700 border-slate-700 text-slate-200'
+                              : 'bg-slate-800/60 border-slate-700/60 text-slate-200'
                           }`}
                         >
                           <div className="flex items-center justify-between text-[10px] opacity-70 mb-1">
@@ -502,7 +518,7 @@ export const App: React.FC = () => {
       </main>
 
       {/* Render Ambient HUD during Live Mode */}
-      {status === 'connected' && sessionMode === 'live' && <LiveModeHUD metrics={metrics} />}
+      {isSessionActive && sessionMode === 'live' && <LiveModeHUD metrics={metrics} />}
     </div>
   );
 };
