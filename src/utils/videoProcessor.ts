@@ -16,13 +16,14 @@ export class VideoProcessor {
   }
 
   public async start(videoPreviewElement?: HTMLVideoElement): Promise<MediaStream> {
-    this.mediaStream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        width: { ideal: 640 },
-        height: { ideal: 480 },
-        frameRate: { ideal: 15 },
-      },
-    });
+    try {
+      this.mediaStream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+      });
+    } catch (e) {
+      console.error('[VideoProcessor] Camera access rejected or unavailable:', e);
+      throw new Error('Camera access denied or webcam in use by another app.');
+    }
 
     if (videoPreviewElement) {
       this.videoElement = videoPreviewElement;
@@ -30,6 +31,14 @@ export class VideoProcessor {
       this.videoElement.muted = true;
       this.videoElement.playsInline = true;
       this.videoElement.autoplay = true;
+
+      this.videoElement.onloadedmetadata = () => {
+        if (this.videoElement) {
+          this.videoElement.play().catch((err) => {
+            console.warn('[VideoProcessor] Video play notice:', err);
+          });
+        }
+      };
       await this.videoElement.play().catch(() => {});
     } else {
       this.videoElement = document.createElement('video');
@@ -85,6 +94,9 @@ export class VideoProcessor {
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach((track) => track.stop());
       this.mediaStream = null;
+    }
+    if (this.videoElement) {
+      this.videoElement.srcObject = null;
     }
   }
 }

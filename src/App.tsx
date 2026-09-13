@@ -28,6 +28,7 @@ import {
   Zap,
   Clock,
   Camera,
+  AlertTriangle,
 } from 'lucide-react';
 
 export const App: React.FC = () => {
@@ -41,6 +42,7 @@ export const App: React.FC = () => {
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
   const [audioLevel, setAudioLevel] = useState<number>(0);
   const [lastFrameSnapshot, setLastFrameSnapshot] = useState<string>('');
+  const [cameraError, setCameraError] = useState<string | null>(null);
 
   // Metrics & transcript logs
   const [metrics, setMetrics] = useState<MetricSnapshot>({
@@ -66,9 +68,28 @@ export const App: React.FC = () => {
   const timerRef = useRef<number | null>(null);
   const metricTimerRef = useRef<number | null>(null);
 
+  // Initialize camera preview on mount
   useEffect(() => {
     getAllTeardowns().catch(console.error);
+    initPreviewCamera();
   }, []);
+
+  const initPreviewCamera = async () => {
+    try {
+      setCameraError(null);
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.muted = true;
+        videoRef.current.playsInline = true;
+        videoRef.current.autoplay = true;
+        await videoRef.current.play().catch(() => {});
+      }
+    } catch (err: any) {
+      console.warn('[Camera Init] Camera preview note:', err);
+      setCameraError(err.message || 'Camera access blocked or webcam in use by another app.');
+    }
+  };
 
   // Timer loop when session is active
   useEffect(() => {
@@ -106,6 +127,7 @@ export const App: React.FC = () => {
     setActiveTeardown(null);
     setElapsedSeconds(0);
     setLastFrameSnapshot('');
+    setCameraError(null);
     setIsSessionActive(true);
     metricsEngineRef.current.reset();
 
@@ -195,10 +217,9 @@ export const App: React.FC = () => {
         console.warn('Backend teardown fallback note:', e);
       }
 
-      // Robust Fallback Teardown Report to guarantee non-empty feedback
       if (!teardownReport || !teardownReport.scores) {
         const userQuotes = transcripts.filter((t) => t.speaker === 'user');
-        const firstQuote = userQuotes[0]?.text || 'I started my presentation talking about our roadmap.';
+        const firstQuote = userQuotes[0]?.text || 'I started my presentation talking about our product launch.';
         const secondQuote = userQuotes[1]?.text || 'We ran into a major obstacle with scaling.';
 
         teardownReport = {
@@ -428,9 +449,9 @@ export const App: React.FC = () => {
 
             {/* Studio Grid */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-              {/* Camera Feed & 1 FPS Frame Snapshot Box */}
+              {/* Camera Feed & Diagnostic Card */}
               <div className="lg:col-span-6 space-y-6">
-                <div className="bg-slate-900/90 rounded-3xl border border-slate-800 overflow-hidden relative aspect-video shadow-2xl group">
+                <div className="bg-slate-900/90 rounded-3xl border border-slate-800 overflow-hidden relative aspect-video shadow-2xl group flex items-center justify-center">
                   <video
                     ref={videoRef}
                     autoPlay
@@ -438,6 +459,21 @@ export const App: React.FC = () => {
                     playsInline
                     className="w-full h-full object-cover bg-slate-950"
                   />
+
+                  {/* Camera Error / Permission Callout Overlay */}
+                  {cameraError && (
+                    <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-md p-6 flex flex-col items-center justify-center text-center space-y-3">
+                      <AlertTriangle className="w-10 h-10 text-amber-400 animate-pulse" />
+                      <div className="font-bold text-white text-sm">Camera Stream Not Loaded</div>
+                      <p className="text-xs text-slate-400 max-w-xs">{cameraError}</p>
+                      <button
+                        onClick={initPreviewCamera}
+                        className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold rounded-xl transition-all shadow-md shadow-cyan-900/40"
+                      >
+                        Request Camera Access Again
+                      </button>
+                    </div>
+                  )}
 
                   {/* Top Overlay Badges */}
                   <div className="absolute top-4 left-4 flex items-center gap-2.5">
