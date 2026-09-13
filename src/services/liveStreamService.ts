@@ -7,6 +7,7 @@ export interface LiveStreamCallbacks {
   onStatusChange: (status: ConnectionStatus, message?: string) => void;
   onTranscript: (speaker: 'user' | 'coach', text: string, isInterim?: boolean) => void;
   onChunkEvent: (chunkIndex: number, action: 'reconnecting' | 'connected') => void;
+  onFrameSnapshot?: (dataUrl: string) => void;
   onLog: (logText: string) => void;
 }
 
@@ -49,7 +50,6 @@ export class LiveStreamService {
 
       this.pcm24Player = new PCM24Player();
 
-      // Fix Bug #2: Only record finalized transcript segments to history
       this.speechManager = new SpeechRecognitionManager((text, isFinal) => {
         if (text) {
           if (isFinal) {
@@ -103,7 +103,6 @@ export class LiveStreamService {
   }
 
   private async startMediaCapture(videoElement?: HTMLVideoElement): Promise<void> {
-    // 1. Microphone capture (16kHz PCM base64)
     this.audioRecorder = new AudioRecorder((base64Pcm) => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         const realtimeAudioInput = {
@@ -121,8 +120,10 @@ export class LiveStreamService {
     });
     await this.audioRecorder.start();
 
-    // 2. Camera capture (1 FPS JPEG base64) - Fix Bug #1: Verify image/jpeg payload and log byte length
-    this.videoProcessor = new VideoProcessor((base64Jpeg, byteLength) => {
+    this.videoProcessor = new VideoProcessor((base64Jpeg, byteLength, dataUrl) => {
+      if (this.callbacks.onFrameSnapshot) {
+        this.callbacks.onFrameSnapshot(dataUrl);
+      }
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         const realtimeVideoInput = {
           realtimeInput: {
@@ -135,7 +136,6 @@ export class LiveStreamService {
           },
         };
         this.ws.send(JSON.stringify(realtimeVideoInput));
-        this.callbacks.onLog(`[Video Stream] Sent 1 FPS JPEG frame (${byteLength} bytes)`);
       }
     });
     await this.videoProcessor.start(videoElement);

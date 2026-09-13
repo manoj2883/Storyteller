@@ -5,7 +5,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
 import { GoogleGenAI } from '@google/genai';
-import { TEARDOWN_PROMPT } from '../src/prompts/teardown.js';
+import { TEARDOWN_PROMPT } from './prompts/teardown.js';
 
 dotenv.config();
 

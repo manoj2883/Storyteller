@@ -1,6 +1,6 @@
 /**
  * Video Capture Processor (1 Frame Per Second)
- * Captures video frames from camera stream and encodes to JPEG base64 strings
+ * Captures video frames from camera stream, encodes to JPEG base64, and provides frame preview
  */
 
 export class VideoProcessor {
@@ -8,9 +8,10 @@ export class VideoProcessor {
   private videoElement: HTMLVideoElement | null = null;
   private canvasElement: HTMLCanvasElement | null = null;
   private timerId: number | null = null;
-  private onFrameCallback: (base64Jpeg: string, byteLength: number) => void;
+  private lastFrameDataUrl: string = '';
+  private onFrameCallback: (base64Jpeg: string, byteLength: number, dataUrl: string) => void;
 
-  constructor(onFrame: (base64Jpeg: string, byteLength: number) => void) {
+  constructor(onFrame: (base64Jpeg: string, byteLength: number, dataUrl: string) => void) {
     this.onFrameCallback = onFrame;
   }
 
@@ -26,11 +27,16 @@ export class VideoProcessor {
     if (videoPreviewElement) {
       this.videoElement = videoPreviewElement;
       this.videoElement.srcObject = this.mediaStream;
+      this.videoElement.muted = true;
+      this.videoElement.playsInline = true;
+      this.videoElement.autoplay = true;
       await this.videoElement.play().catch(() => {});
     } else {
       this.videoElement = document.createElement('video');
       this.videoElement.srcObject = this.mediaStream;
       this.videoElement.muted = true;
+      this.videoElement.playsInline = true;
+      this.videoElement.autoplay = true;
       await this.videoElement.play().catch(() => {});
     }
 
@@ -49,9 +55,7 @@ export class VideoProcessor {
   private captureFrame(): void {
     if (!this.videoElement || !this.canvasElement) return;
 
-    // Ensure video metadata has loaded and current frame is rendered (readyState >= 2)
     if (this.videoElement.readyState < 2) {
-      console.warn('[VideoProcessor] Video element not ready yet (readyState < 2). Skipping frame.');
       return;
     }
 
@@ -59,19 +63,18 @@ export class VideoProcessor {
     if (!ctx) return;
 
     ctx.drawImage(this.videoElement, 0, 0, 640, 480);
-    // Encode canvas to JPEG image base64 string
     const dataUrl = this.canvasElement.toDataURL('image/jpeg', 0.6);
+    this.lastFrameDataUrl = dataUrl;
     const base64Data = dataUrl.split(',')[1];
     
     if (base64Data) {
       const byteLength = base64Data.length;
-      if (byteLength < 1500) {
-        console.warn(`[VideoProcessor] Warning: Captured frame is unusually small (${byteLength} bytes). Canvas may be blank.`);
-      } else {
-        console.log(`[VideoProcessor] Captured 1 FPS JPEG frame (${byteLength} bytes).`);
-      }
-      this.onFrameCallback(base64Data, byteLength);
+      this.onFrameCallback(base64Data, byteLength, dataUrl);
     }
+  }
+
+  public getLastFrameDataUrl(): string {
+    return this.lastFrameDataUrl;
   }
 
   public stop(): void {
