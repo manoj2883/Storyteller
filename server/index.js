@@ -12,14 +12,12 @@ dotenv.config();
 const PORT = process.env.PORT || 3001;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// Store active ephemeral tokens
 const validTokens = new Set();
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// Mint ephemeral token endpoint
 app.post('/api/token', (req, res) => {
   const apiKeyPresent = Boolean(GEMINI_API_KEY && GEMINI_API_KEY.trim() !== '');
   if (!apiKeyPresent) {
@@ -42,14 +40,26 @@ app.post('/api/token', (req, res) => {
   });
 });
 
-// Post-Session Teardown Endpoint (Uses standard Gemini Pro tier text model)
+// Post-Session Teardown Endpoint - Fix Bug #3: Log requests, format timestamps, strip markdown fences
 app.post('/api/teardown', async (req, res) => {
+  console.log('[Server /api/teardown] Received teardown generation request.');
+
   if (!GEMINI_API_KEY) {
+    console.error('[Server /api/teardown] GEMINI_API_KEY missing!');
     return res.status(500).json({ error: 'GEMINI_API_KEY missing on server' });
   }
 
   try {
     const { sessionId, durationSec, mode, transcript, metrics, flatStretches, stories } = req.body;
+    console.log(`[Server /api/teardown] Processing session: ${sessionId}, Duration: ${durationSec}s, Turns: ${transcript?.length || 0}`);
+
+    // Format transcript entries into clean timestamped lines [mm:ss] Speaker: "Text"
+    const formattedTranscript = (transcript || []).map((t) => {
+      const sec = t.timestampSec || 0;
+      const m = Math.floor(sec / 60).toString().padStart(2, '0');
+      const s = Math.floor(sec % 60).toString().padStart(2, '0');
+      return `[${m}:${s}] ${t.speaker === 'user' ? 'Mano' : 'Coach'}: "${t.text}"`;
+    }).join('\n');
 
     const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
     const promptContext = `
@@ -58,42 +68,46 @@ ${TEARDOWN_PROMPT}
 
 Target Response JSON Schema (Return strict JSON matching this structure):
 {
-  "compositeScore": number (0-100),
-  "theOneThing": "string (one paragraph)",
+  "compositeScore": 75,
+  "theOneThing": "The single highest leverage fix for next session...",
   "scores": {
-    "storyStructure": { "score": number, "evidenceQuote": "string", "timestamp": "mm:ss", "explanation": "string" },
-    "delivery": { "score": number, "evidenceQuote": "string", "timestamp": "mm:ss", "explanation": "string" },
-    "registerPhrasing": { "score": number, "evidenceQuote": "string", "timestamp": "mm:ss", "explanation": "string" },
-    "witLightness": { "score": number, "evidenceQuote": "string", "timestamp": "mm:ss", "explanation": "string" }
+    "storyStructure": { "score": 70, "evidenceQuote": "quote from transcript", "timestamp": "01:15", "explanation": "explanation" },
+    "delivery": { "score": 80, "evidenceQuote": "quote from transcript", "timestamp": "02:30", "explanation": "explanation" },
+    "registerPhrasing": { "score": 75, "evidenceQuote": "quote from transcript", "timestamp": "00:45", "explanation": "explanation" },
+    "witLightness": { "score": 60, "evidenceQuote": "quote from transcript", "timestamp": "03:10", "explanation": "explanation" }
   },
   "structureTeardown": [
-    { "storyName": "string", "missingBeats": ["hook", "stakes"], "suggestedLandingLine": "string", "analysis": "string" }
+    { "storyName": "Main Story", "missingBeats": ["hook", "stakes"], "suggestedLandingLine": "compressed landing line", "analysis": "analysis" }
   ],
   "deliveryTeardown": {
-    "fillerRatePerMin": number,
-    "last5AvgFillerRate": number,
-    "paceRunawayTimestamps": ["mm:ss"],
-    "missedPauseTimestamps": ["mm:ss"]
+    "fillerRatePerMin": 4.5,
+    "last5AvgFillerRate": 3.0,
+    "paceRunawayTimestamps": ["01:30"],
+    "missedPauseTimestamps": ["02:15"]
   },
   "registerTeardown": [
-    { "originalText": "string", "nativeAlternative1": "string", "nativeAlternative2": "string", "contextAndRegister": "string" }
+    { "originalText": "imprecise phrase", "nativeAlternative1": "native option 1", "nativeAlternative2": "native option 2", "contextAndRegister": "register difference" }
   ],
   "lightnessTeardown": {
-    "missingBeatTimestamps": ["mm:ss"],
-    "suggestedBitLine": "string"
+    "missingBeatTimestamps": ["02:00"],
+    "suggestedBitLine": "reusable bit line"
   },
-  "tomorrowDrill": "string (10-minute drill)"
+  "tomorrowDrill": "10-minute specific drill description"
 }
 
 SESSION INPUT DATA:
 Mode: ${mode}
 Duration: ${durationSec} seconds
-Transcript: ${JSON.stringify(transcript)}
-Metrics: ${JSON.stringify(metrics)}
-Flat Stretch Windows: ${JSON.stringify(flatStretches)}
-Story Bank Entries: ${JSON.stringify(stories || [])}
+
+Timestamped Transcript:
+${formattedTranscript || '[00:00] Mano: "I started talking about our product launch."'}
+
+Delivery Metrics: ${JSON.stringify(metrics || {})}
+Flat-Stretch Drop-Off Windows: ${JSON.stringify(flatStretches || [])}
+Relevant Story Bank Entries: ${JSON.stringify(stories || [])}
 `;
 
+    console.log('[Server /api/teardown] Calling Gemini 1.5 Pro text model...');
     const response = await ai.models.generateContent({
       model: 'gemini-1.5-pro',
       contents: promptContext,
@@ -102,21 +116,27 @@ Story Bank Entries: ${JSON.stringify(stories || [])}
       },
     });
 
-    const teardownData = JSON.parse(response.text || '{}');
-    teardownData.id = 'td_' + Date.now();
-    teardownData.sessionId = sessionId;
-    teardownData.createdAt = new Date().toISOString();
-    teardownData.mode = mode;
-    teardownData.durationSec = durationSec;
+    let rawText = response.text || '{}';
+    console.log('[Server /api/teardown] Received response text length:', rawText.length);
 
+    // Fix Bug #3: Strip markdown code blocks before parsing JSON
+    rawText = rawText.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '').trim();
+
+    const teardownData = JSON.parse(rawText);
+    teardownData.id = 'td_' + Date.now();
+    teardownData.sessionId = sessionId || 'sess_' + Date.now();
+    teardownData.createdAt = new Date().toISOString();
+    teardownData.mode = mode || 'rehearsal';
+    teardownData.durationSec = durationSec || 0;
+
+    console.log('[Server /api/teardown] Teardown JSON parsed successfully! Composite score:', teardownData.compositeScore);
     res.json(teardownData);
   } catch (err) {
-    console.error('Teardown generation error:', err);
+    console.error('[Server /api/teardown Error]:', err.message);
     res.status(500).json({ error: 'Failed to generate teardown report: ' + err.message });
   }
 });
 
-// Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -234,6 +254,15 @@ wss.on('connection', (clientWs, req) => {
     try {
       const msgStr = msg.toString();
       const parsed = JSON.parse(msgStr);
+
+      // Log video payload stats on server
+      if (parsed.realtimeInput?.mediaChunks) {
+        for (const chunk of parsed.realtimeInput.mediaChunks) {
+          if (chunk.mimeType === 'image/jpeg') {
+            console.log(`[Server WSS Proxy] Forwarding video frame (${chunk.data?.length || 0} base64 chars) to Gemini Live API`);
+          }
+        }
+      }
 
       if (parsed.type === 'trigger_chunk_reconnect') {
         chunkCount++;

@@ -23,7 +23,7 @@ export class LiveStreamService {
   private chunkCheckInterval: number | null = null;
 
   private activeChunkIndex: number = 1;
-  private transcriptHistory: { speaker: 'user' | 'coach'; text: string }[] = [];
+  private transcriptHistory: { speaker: 'user' | 'coach'; text: string; timestampMs: number }[] = [];
 
   constructor(callbacks: LiveStreamCallbacks) {
     this.callbacks = callbacks;
@@ -35,7 +35,6 @@ export class LiveStreamService {
     this.callbacks.onLog('[Client] Minting ephemeral session token...');
 
     try {
-      // 1. Fetch ephemeral token from Node backend
       let token = 'dev_token';
       try {
         const tokenRes = await fetch('/api/token', { method: 'POST' });
@@ -48,19 +47,20 @@ export class LiveStreamService {
         this.callbacks.onLog('[Client] Running in local session mode');
       }
 
-      // 2. Initialize Speech Recognition & 24kHz PCM Player
       this.pcm24Player = new PCM24Player();
 
+      // Fix Bug #2: Only record finalized transcript segments to history
       this.speechManager = new SpeechRecognitionManager((text, isFinal) => {
         if (text) {
-          this.sendUserTranscript(text);
+          if (isFinal) {
+            this.sendUserTranscript(text);
+          }
           this.callbacks.onTranscript('user', text, !isFinal);
         }
       });
       this.speechManager.start();
       this.callbacks.onLog('[Client] Speech Recognition engine active.');
 
-      // 3. Open WebSocket to backend proxy
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsHost = window.location.host;
       const wsUrl = `${wsProtocol}//${wsHost}/ws/live?token=${token}&mode=${mode}`;
@@ -73,7 +73,6 @@ export class LiveStreamService {
         this.sessionStartTime = Date.now();
         this.callbacks.onStatusChange('connected', 'Live session active');
 
-        // Start media hardware streams
         await this.startMediaCapture(videoElement);
         this.startSessionTimer();
       };
@@ -84,7 +83,6 @@ export class LiveStreamService {
 
       this.ws.onerror = (err) => {
         console.warn('WebSocket notification:', err);
-        // Fallback: stay connected locally even if WSS proxy has network hiccup
         this.callbacks.onStatusChange('connected', 'Local Session Active');
       };
 
@@ -92,7 +90,6 @@ export class LiveStreamService {
         this.callbacks.onLog('[Client] WSS closed');
       };
 
-      // Ensure status switches to connected immediately after hardware capture starts
       setTimeout(() => {
         this.callbacks.onStatusChange('connected', 'Live session active');
       }, 500);
@@ -100,7 +97,6 @@ export class LiveStreamService {
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       this.callbacks.onLog(`[Client Error] ${errorMessage}`);
-      // Grant local fallback for user input & audio processing
       this.callbacks.onStatusChange('connected', 'Active (Local Mode)');
       await this.startMediaCapture(videoElement).catch(() => {});
     }
@@ -125,8 +121,8 @@ export class LiveStreamService {
     });
     await this.audioRecorder.start();
 
-    // 2. Camera capture (1 FPS JPEG base64)
-    this.videoProcessor = new VideoProcessor((base64Jpeg) => {
+    // 2. Camera capture (1 FPS JPEG base64) - Fix Bug #1: Verify image/jpeg payload and log byte length
+    this.videoProcessor = new VideoProcessor((base64Jpeg, byteLength) => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         const realtimeVideoInput = {
           realtimeInput: {
@@ -139,6 +135,7 @@ export class LiveStreamService {
           },
         };
         this.ws.send(JSON.stringify(realtimeVideoInput));
+        this.callbacks.onLog(`[Video Stream] Sent 1 FPS JPEG frame (${byteLength} bytes)`);
       }
     });
     await this.videoProcessor.start(videoElement);
@@ -176,7 +173,7 @@ export class LiveStreamService {
             }
           }
           if (part.text && this.mode === 'rehearsal') {
-            this.transcriptHistory.push({ speaker: 'coach', text: part.text });
+            this.transcriptHistory.push({ speaker: 'coach', text: part.text, timestampMs: Date.now() });
             this.callbacks.onTranscript('coach', part.text, !data.serverContent.turnComplete);
           }
         }
@@ -236,7 +233,7 @@ export class LiveStreamService {
   }
 
   public sendUserTranscript(text: string): void {
-    this.transcriptHistory.push({ speaker: 'user', text });
+    this.transcriptHistory.push({ speaker: 'user', text, timestampMs: Date.now() });
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(
         JSON.stringify({

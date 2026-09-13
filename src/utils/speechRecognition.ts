@@ -1,6 +1,6 @@
 /**
  * Browser Web Speech Recognition Manager
- * Captures user speech transcripts in real-time for client-side WPM & filler detection
+ * Captures user speech transcripts in real-time, emitting finalized segments with timestamps
  */
 
 export class SpeechRecognitionManager {
@@ -21,36 +21,36 @@ export class SpeechRecognitionManager {
       this.recognition.lang = 'en-US';
 
       this.recognition.onresult = (event: any) => {
-        let interimTranscript = '';
         for (let i = event.resultIndex; i < event.results.length; ++i) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            this.onTranscriptCallback(transcript.trim(), true);
+          const result = event.results[i];
+          const transcriptText = result[0].transcript.trim();
+
+          if (result.isFinal) {
+            // Emit ONLY finalized segments to prevent run-on walls of text
+            console.log('[SpeechRecognition] Finalized segment:', transcriptText);
+            this.onTranscriptCallback(transcriptText, true);
           } else {
-            interimTranscript += transcript;
+            // Emit interim results strictly for live display
+            this.onTranscriptCallback(transcriptText, false);
           }
-        }
-        if (interimTranscript.trim()) {
-          this.onTranscriptCallback(interimTranscript.trim(), false);
         }
       };
 
       this.recognition.onerror = (event: any) => {
-        console.warn('Speech recognition event warning/error:', event.error);
+        console.warn('[SpeechRecognition] Event note:', event.error);
       };
 
       this.recognition.onend = () => {
-        // Auto restart if active
         if (this.isListening) {
           try {
             this.recognition.start();
           } catch (e) {
-            // ignore restart collision
+            // ignore
           }
         }
       };
     } else {
-      console.warn('Web Speech API not supported in this browser. Falling back to backend transcripts.');
+      console.warn('[SpeechRecognition] Web Speech API not supported in browser.');
     }
   }
 
@@ -71,7 +71,7 @@ export class SpeechRecognitionManager {
       try {
         this.recognition.stop();
       } catch (e) {
-        // ignore stop error
+        // ignore
       }
     }
   }
