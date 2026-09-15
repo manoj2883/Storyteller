@@ -149,18 +149,19 @@ export const App: React.FC = () => {
       },
       onTranscript: (speaker, text, isInterim) => {
         const nowSec = elapsedSeconds;
+        const wallNowSec = Date.now() / 1000;
         // FIX 5: Save ONLY finalized segments
         if (!isInterim) {
           setTranscripts((prev) => [...prev, { speaker, text, timestampSec: nowSec }]);
         }
 
         if (speaker === 'user') {
-          metricsEngineRef.current.addText(text, nowSec);
-          const currentSnap = metricsEngineRef.current.getSnapshot(nowSec);
+          metricsEngineRef.current.addText(text, wallNowSec);
+          const currentSnap = metricsEngineRef.current.getSnapshot(wallNowSec);
           setMetrics(currentSnap);
 
           if (sessionMode === 'rehearsal' && rehearsalEngineRef.current) {
-            rehearsalEngineRef.current.checkMetricsAndText(currentSnap, text, nowSec);
+            rehearsalEngineRef.current.checkMetricsAndText(currentSnap, text, wallNowSec);
           }
         }
       },

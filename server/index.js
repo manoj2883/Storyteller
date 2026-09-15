@@ -214,8 +214,8 @@ wss.on('connection', (clientWs, req) => {
     return;
   }
 
-  // FIX 4: Use current Gemini Live API model (gemini-2.0-flash-exp / gemini-3.1-flash-live-preview)
-  const geminiModel = 'models/gemini-2.0-flash-exp';
+  // FIX 4: Use supported Gemini Live API model (gemini-2.5-flash-native-audio-latest)
+  const geminiModel = 'models/gemini-2.5-flash-native-audio-latest';
   const geminiWsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`;
 
   let geminiWs = null;
@@ -226,17 +226,15 @@ wss.on('connection', (clientWs, req) => {
     geminiWs = new WebSocket(geminiWsUrl);
 
     geminiWs.on('open', () => {
-      // FIX 9: Server-Enforced Silent Live Mode
+      // FIX 9: Server-Enforced Silent Live Mode vs Rehearsal Mode
       let responseModalities = ["AUDIO"];
       let systemPromptText = "";
 
       if (mode === 'live') {
-        // Live Mode: Silent coach, transcription only
-        responseModalities = ["TEXT"];
+        // Live Mode: Silent coach
         systemPromptText = "You are Storyteller, silent speech coach. Observe the talk and output transcript only. Do not generate conversational audio responses.";
       } else {
         // Rehearsal Mode: Active voice coach
-        responseModalities = ["AUDIO"];
         systemPromptText = "You are running a rehearsal with Mano. Camera and mic are on. You may interrupt when he buries point, abstracts, or exceeds 180 WPM.";
       }
 
