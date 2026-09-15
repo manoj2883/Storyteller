@@ -96,4 +96,4 @@ export type TeardownReport = {
   tomorrowDrill: string;
 };
 
-export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "chunking" | "error";
+export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "chunking" | "failed" | "error";

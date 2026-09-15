@@ -1,6 +1,6 @@
 /**
  * Video Capture Processor (1 Frame Per Second)
- * Captures video frames from camera stream, encodes to JPEG base64, and provides frame preview
+ * Captures video frames from camera stream, encodes to JPEG base64, and logs frame sizes
  */
 
 export class VideoProcessor {
@@ -9,6 +9,7 @@ export class VideoProcessor {
   private canvasElement: HTMLCanvasElement | null = null;
   private timerId: number | null = null;
   private lastFrameDataUrl: string = '';
+  private frameCount: number = 0;
   private onFrameCallback: (base64Jpeg: string, byteLength: number, dataUrl: string) => void;
 
   constructor(onFrame: (base64Jpeg: string, byteLength: number, dataUrl: string) => void) {
@@ -34,9 +35,7 @@ export class VideoProcessor {
 
       this.videoElement.onloadedmetadata = () => {
         if (this.videoElement) {
-          this.videoElement.play().catch((err) => {
-            console.warn('[VideoProcessor] Video play notice:', err);
-          });
+          this.videoElement.play().catch(() => {});
         }
       };
       await this.videoElement.play().catch(() => {});
@@ -77,7 +76,14 @@ export class VideoProcessor {
     const base64Data = dataUrl.split(',')[1];
     
     if (base64Data) {
+      this.frameCount++;
       const byteLength = base64Data.length;
+
+      // Fix #3: Explicitly log byte length of first 3 frames
+      if (this.frameCount <= 3) {
+        console.log(`[VideoProcessor] Frame #${this.frameCount} byte length: ${byteLength} bytes`);
+      }
+
       this.onFrameCallback(base64Data, byteLength, dataUrl);
     }
   }
@@ -98,5 +104,6 @@ export class VideoProcessor {
     if (this.videoElement) {
       this.videoElement.srcObject = null;
     }
+    this.frameCount = 0;
   }
 }

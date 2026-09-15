@@ -3,6 +3,15 @@
  * Computes WPM over rolling 15-second window & Filler density over 30 seconds
  */
 
+/**
+ * Default target WPM band. Must be calibrated against Mano's personal baseline
+ * once initial session history exists.
+ */
+export const TARGET_WPM_BAND = {
+  MIN: 120,
+  MAX: 160,
+};
+
 export const FILLER_WORDS = [
   'um',
   'uh',
@@ -25,8 +34,8 @@ export interface MetricSnapshot {
   wpm15s: number;
   fillerCount30s: number;
   fillerDensity30s: number; // Fillers per 100 words in 30s
-  isWpmOutOfRange: boolean; // Target 120 - 160 WPM
-  isFillerThresholdExceeded: boolean; // > 3 fillers per 30s
+  isWpmOutOfRange: boolean;
+  isFillerThresholdExceeded: boolean; // Threshold: >= 5 fillers per 30s window
   detectedFillers: { word: string; timestampSec: number }[];
 }
 
@@ -45,7 +54,6 @@ export class MetricsEngine {
       this.wordLog.push({ word: w, timestampSec });
     }
 
-    // Detect filler phrases and single-word fillers
     const cleanLowerText = text.toLowerCase();
     for (const filler of FILLER_WORDS) {
       const regex = new RegExp(`\\b${filler.replace('?', '\\?')}\\b`, 'gi');
@@ -72,10 +80,9 @@ export class MetricsEngine {
       ? Number(((fillerCount30s / window30sWords.length) * 100).toFixed(1))
       : 0;
 
-    // Target WPM range: 120 - 160 WPM
-    const isWpmOutOfRange = wpm15s > 0 && (wpm15s < 120 || wpm15s > 160);
-    // Filler density threshold: > 2 fillers in 30 seconds
-    const isFillerThresholdExceeded = fillerCount30s >= 2;
+    const isWpmOutOfRange = wpm15s > 0 && (wpm15s < TARGET_WPM_BAND.MIN || wpm15s > TARGET_WPM_BAND.MAX);
+    // Fix #11: Filler threshold is >= 5 per 30s window (interim calibration)
+    const isFillerThresholdExceeded = fillerCount30s >= 5;
 
     return {
       wpm15s,

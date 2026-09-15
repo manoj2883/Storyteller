@@ -21,7 +21,9 @@ export class LiveStreamService {
 
   private mode: SessionMode = 'rehearsal';
   private sessionStartTime: number = 0;
+  private chunkStartTime: number = 0;
   private chunkCheckInterval: number | null = null;
+  private isUserClosed: boolean = false;
 
   private activeChunkIndex: number = 1;
   private transcriptHistory: { speaker: 'user' | 'coach'; text: string; timestampMs: number }[] = [];
@@ -32,24 +34,36 @@ export class LiveStreamService {
 
   public async startSession(mode: SessionMode, videoElement?: HTMLVideoElement): Promise<void> {
     this.mode = mode;
-    this.callbacks.onStatusChange('connecting', 'Acquiring token & initializing media...');
-    this.callbacks.onLog('[Client] Minting ephemeral session token...');
+    this.isUserClosed = false;
+    this.callbacks.onStatusChange('connecting', 'Acquiring session token...');
+    this.callbacks.onLog('[Client] Requesting sessionToken from server /api/session-token...');
+
+    // FIX 3: Start Audio & Video capture independently of socket so camera preview works immediately
+    try {
+      await this.startMediaCapture(videoElement);
+      this.callbacks.onLog('[Client] Hardware media capture active (mic + camera).');
+    } catch (mediaErr: any) {
+      this.callbacks.onLog(`[Client Error] Media capture failed: ${mediaErr.message}`);
+    }
 
     try {
-      let token = 'dev_token';
-      try {
-        const tokenRes = await fetch('/api/token', { method: 'POST' });
-        if (tokenRes.ok) {
-          const data = await tokenRes.json();
-          token = data.token;
-          this.callbacks.onLog(`[Client] Ephemeral token acquired: ${token.substring(0, 16)}...`);
-        }
-      } catch (e) {
-        this.callbacks.onLog('[Client] Running in local session mode');
+      // FIX 7: Fetch sessionToken from backend
+      const tokenRes = await fetch('/api/session-token', { method: 'POST' });
+      if (!tokenRes.ok) {
+        throw new Error(`Server token endpoint returned HTTP ${tokenRes.status}`);
       }
+      const tokenData = await tokenRes.json();
+      const sessionToken = tokenData.sessionToken || tokenData.token;
 
+      if (!sessionToken) {
+        throw new Error('Server response contained no sessionToken');
+      }
+      this.callbacks.onLog(`[Client] Acquired sessionToken: ${sessionToken.substring(0, 16)}...`);
+
+      // Initialize speech recognition & audio player
       this.pcm24Player = new PCM24Player();
 
+      // FIX 5: Only record finalized transcript segments to history
       this.speechManager = new SpeechRecognitionManager((text, isFinal) => {
         if (text) {
           if (isFinal) {
@@ -59,21 +73,21 @@ export class LiveStreamService {
         }
       });
       this.speechManager.start();
-      this.callbacks.onLog('[Client] Speech Recognition engine active.');
 
+      // FIX 1: Connect to ws://localhost:3001/ws/live
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsHost = window.location.host;
-      const wsUrl = `${wsProtocol}//${wsHost}/ws/live?token=${token}&mode=${mode}`;
+      const wsUrl = `${wsProtocol}//${wsHost}/ws/live?token=${sessionToken}&mode=${mode}`;
 
-      this.callbacks.onLog(`[Client] Opening WebSocket to proxy...`);
+      this.callbacks.onLog(`[Client] Opening WebSocket to ${wsUrl}`);
       this.ws = new WebSocket(wsUrl);
 
-      this.ws.onopen = async () => {
-        this.callbacks.onLog('[Client] WebSocket connected.');
+      // FIX 2: Only report "connected" when onopen has fired!
+      this.ws.onopen = () => {
+        this.callbacks.onLog('[Client] WebSocket onopen fired. Session connected!');
         this.sessionStartTime = Date.now();
+        this.chunkStartTime = Date.now();
         this.callbacks.onStatusChange('connected', 'Live session active');
-
-        await this.startMediaCapture(videoElement);
         this.startSessionTimer();
       };
 
@@ -81,29 +95,35 @@ export class LiveStreamService {
         this.handleServerMessage(event.data);
       };
 
-      this.ws.onerror = (err) => {
-        console.warn('WebSocket notification:', err);
-        this.callbacks.onStatusChange('connected', 'Local Session Active');
+      // FIX 2: Handle onerror with real failed status and error text. Remove all "Local Mode" fallbacks.
+      this.ws.onerror = (err: Event) => {
+        console.error('[Client WSS Error]', err);
+        this.callbacks.onLog('[Client Error] WebSocket error occurred.');
+        this.callbacks.onStatusChange('failed', 'WebSocket Connection Failed');
       };
 
-      this.ws.onclose = () => {
-        this.callbacks.onLog('[Client] WSS closed');
+      // FIX 2: Handle onclose - set disconnected unless user-initiated
+      this.ws.onclose = (event: CloseEvent) => {
+        this.callbacks.onLog(`[Client] WebSocket onclose fired (Code ${event.code}: ${event.reason || 'Closed'})`);
+        if (!this.isUserClosed) {
+          this.callbacks.onStatusChange('failed', `Socket closed (${event.code}: ${event.reason || 'Connection lost'})`);
+        } else {
+          this.callbacks.onStatusChange('disconnected', 'Session ended');
+        }
       };
-
-      setTimeout(() => {
-        this.callbacks.onStatusChange('connected', 'Live session active');
-      }, 500);
 
     } catch (err: unknown) {
+      // FIX 2: If session initialization fails, set status to failed. No fake connected or local fallback.
       const errorMessage = err instanceof Error ? err.message : String(err);
-      this.callbacks.onLog(`[Client Error] ${errorMessage}`);
-      this.callbacks.onStatusChange('connected', 'Active (Local Mode)');
-      await this.startMediaCapture(videoElement).catch(() => {});
+      this.callbacks.onLog(`[Client Error] Session start failed: ${errorMessage}`);
+      this.callbacks.onStatusChange('failed', errorMessage);
     }
   }
 
   private async startMediaCapture(videoElement?: HTMLVideoElement): Promise<void> {
+    // 1. Microphone capture (16kHz PCM base64)
     this.audioRecorder = new AudioRecorder((base64Pcm) => {
+      // FIX 3: Gate sending on ws.readyState === WebSocket.OPEN
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         const realtimeAudioInput = {
           realtimeInput: {
@@ -120,10 +140,12 @@ export class LiveStreamService {
     });
     await this.audioRecorder.start();
 
+    // 2. Camera capture (1 FPS JPEG base64)
     this.videoProcessor = new VideoProcessor((base64Jpeg, byteLength, dataUrl) => {
       if (this.callbacks.onFrameSnapshot) {
         this.callbacks.onFrameSnapshot(dataUrl);
       }
+      // FIX 3: Gate sending on ws.readyState === WebSocket.OPEN
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         const realtimeVideoInput = {
           realtimeInput: {
@@ -150,7 +172,7 @@ export class LiveStreamService {
       const data = JSON.parse(dataStr);
 
       if (data.type === 'status') {
-        this.callbacks.onLog(`[Server] ${data.message}`);
+        this.callbacks.onLog(`[Server Status] ${data.message}`);
         if (data.chunkIndex) {
           this.activeChunkIndex = data.chunkIndex;
           this.callbacks.onChunkEvent(data.chunkIndex, 'connected');
@@ -164,6 +186,7 @@ export class LiveStreamService {
         return;
       }
 
+      // Handle Live API response
       if (data.serverContent) {
         const parts = data.serverContent.modelTurn?.parts || [];
         for (const part of parts) {
@@ -172,6 +195,7 @@ export class LiveStreamService {
               this.pcm24Player.playChunk(part.inlineData.data);
             }
           }
+          // FIX 5: Record finalized model turn text
           if (part.text && this.mode === 'rehearsal') {
             this.transcriptHistory.push({ speaker: 'coach', text: part.text, timestampMs: Date.now() });
             this.callbacks.onTranscript('coach', part.text, !data.serverContent.turnComplete);
@@ -186,25 +210,36 @@ export class LiveStreamService {
   public triggerChunkReconnect(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.activeChunkIndex++;
+    this.chunkStartTime = Date.now();
     this.callbacks.onChunkEvent(this.activeChunkIndex, 'reconnecting');
+
+    // FIX 10: Build summary from finalized transcript entries
+    const transcriptSummary = this.transcriptHistory
+      .slice(-15)
+      .map((t) => `${t.speaker}: ${t.text}`)
+      .join('\n');
+
     this.ws.send(
       JSON.stringify({
         type: 'trigger_chunk_reconnect',
-        context: 'User chunking request',
+        context: transcriptSummary || 'User continuing session...',
       })
     );
   }
 
   private startSessionTimer(): void {
+    // FIX 10: Track chunk start timestamp instead of modulus on interval
     this.chunkCheckInterval = window.setInterval(() => {
-      const elapsedSec = Math.floor((Date.now() - this.sessionStartTime) / 1000);
-      if (elapsedSec > 0 && elapsedSec % 540 === 0) {
+      const chunkElapsedSec = Math.floor((Date.now() - this.chunkStartTime) / 1000);
+      if (chunkElapsedSec >= 540) { // 9 minutes threshold out of 10 min cap
+        this.callbacks.onLog(`[Chunking Engine] 9-minute threshold reached (${chunkElapsedSec}s). Triggering chunk reconnect...`);
         this.triggerChunkReconnect();
       }
     }, 5000);
   }
 
   public endSession(): void {
+    this.isUserClosed = true;
     if (this.chunkCheckInterval !== null) {
       clearInterval(this.chunkCheckInterval);
       this.chunkCheckInterval = null;
@@ -242,5 +277,9 @@ export class LiveStreamService {
         })
       );
     }
+  }
+
+  public getChunkIndex(): number {
+    return this.activeChunkIndex;
   }
 }

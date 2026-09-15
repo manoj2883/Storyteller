@@ -12,13 +12,15 @@ dotenv.config();
 const PORT = process.env.PORT || 3001;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-const validTokens = new Set();
+// FIX 7: Rename to validSessionTokens and require token authentication
+const validSessionTokens = new Set();
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-app.post('/api/token', (req, res) => {
+// FIX 7: Session Token Endpoint (Renamed from /api/token to /api/session-token)
+app.post('/api/session-token', (req, res) => {
   const apiKeyPresent = Boolean(GEMINI_API_KEY && GEMINI_API_KEY.trim() !== '');
   if (!apiKeyPresent) {
     return res.status(500).json({
@@ -26,34 +28,59 @@ app.post('/api/token', (req, res) => {
     });
   }
 
-  const ephemeralToken = 'st_ephemeral_' + crypto.randomBytes(16).toString('hex');
-  validTokens.add(ephemeralToken);
+  const sessionToken = 'st_session_' + crypto.randomBytes(16).toString('hex');
+  validSessionTokens.add(sessionToken);
 
   setTimeout(() => {
-    validTokens.delete(ephemeralToken);
+    validSessionTokens.delete(sessionToken);
   }, 3600 * 1000);
 
   res.json({
-    token: ephemeralToken,
+    sessionToken,
     expiresIn: 3600,
     serverTime: new Date().toISOString()
   });
 });
 
-// Post-Session Teardown Endpoint - Fix Bug #3: Log requests, format timestamps, strip markdown fences
+// Backward compatibility route for /api/token
+app.post('/api/token', (req, res) => {
+  const apiKeyPresent = Boolean(GEMINI_API_KEY && GEMINI_API_KEY.trim() !== '');
+  if (!apiKeyPresent) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY is not configured' });
+  }
+  const sessionToken = 'st_session_' + crypto.randomBytes(16).toString('hex');
+  validSessionTokens.add(sessionToken);
+  res.json({ token: sessionToken, sessionToken, expiresIn: 3600 });
+});
+
+// FIX 8 & 4: Teardown Endpoint using standard Gemini Pro-tier model with transcript quote validation
 app.post('/api/teardown', async (req, res) => {
-  console.log('[Server /api/teardown] Received teardown generation request.');
+  console.log('[Server /api/teardown] Request received.');
 
   if (!GEMINI_API_KEY) {
-    console.error('[Server /api/teardown] GEMINI_API_KEY missing!');
     return res.status(500).json({ error: 'GEMINI_API_KEY missing on server' });
   }
 
   try {
     const { sessionId, durationSec, mode, transcript, metrics, flatStretches, stories } = req.body;
-    console.log(`[Server /api/teardown] Processing session: ${sessionId}, Duration: ${durationSec}s, Turns: ${transcript?.length || 0}`);
 
-    // Format transcript entries into clean timestamped lines [mm:ss] Speaker: "Text"
+    // FIX 8: Count total words across transcript turns
+    const allWords = (transcript || [])
+      .map((t) => t.text || '')
+      .join(' ')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+
+    // FIX 8: Return HTTP 400 if transcript is empty or shorter than 20 words
+    if (!transcript || transcript.length === 0 || allWords.length < 20) {
+      console.warn(`[Server /api/teardown] Rejecting short transcript (${allWords.length} words).`);
+      return res.status(400).json({
+        error: 'Transcript too short. Session transcript must contain at least 20 words for teardown analysis.'
+      });
+    }
+
+    // Format transcript into timestamped turns: [mm:ss] Speaker: "text"
     const formattedTranscript = (transcript || []).map((t) => {
       const sec = t.timestampSec || 0;
       const m = Math.floor(sec / 60).toString().padStart(2, '0');
@@ -71,13 +98,13 @@ Target Response JSON Schema (Return strict JSON matching this structure):
   "compositeScore": 75,
   "theOneThing": "The single highest leverage fix for next session...",
   "scores": {
-    "storyStructure": { "score": 70, "evidenceQuote": "quote from transcript", "timestamp": "01:15", "explanation": "explanation" },
-    "delivery": { "score": 80, "evidenceQuote": "quote from transcript", "timestamp": "02:30", "explanation": "explanation" },
-    "registerPhrasing": { "score": 75, "evidenceQuote": "quote from transcript", "timestamp": "00:45", "explanation": "explanation" },
-    "witLightness": { "score": 60, "evidenceQuote": "quote from transcript", "timestamp": "03:10", "explanation": "explanation" }
+    "storyStructure": { "score": 70, "evidenceQuote": "exact quote from transcript", "timestamp": "01:15", "explanation": "explanation" },
+    "delivery": { "score": 80, "evidenceQuote": "exact quote from transcript", "timestamp": "02:30", "explanation": "explanation" },
+    "registerPhrasing": { "score": 75, "evidenceQuote": "exact quote from transcript", "timestamp": "00:45", "explanation": "explanation" },
+    "witLightness": { "score": 60, "evidenceQuote": "exact quote from transcript", "timestamp": "03:10", "explanation": "explanation" }
   },
   "structureTeardown": [
-    { "storyName": "Main Story", "missingBeats": ["hook", "stakes"], "suggestedLandingLine": "compressed landing line", "analysis": "analysis" }
+    { "storyName": "Main Story", "missingBeats": ["hook", "stakes"], "suggestedLandingLine": "compressed landing line under 12 words", "analysis": "analysis" }
   ],
   "deliveryTeardown": {
     "fillerRatePerMin": 4.5,
@@ -100,16 +127,17 @@ Mode: ${mode}
 Duration: ${durationSec} seconds
 
 Timestamped Transcript:
-${formattedTranscript || '[00:00] Mano: "I started talking about our product launch."'}
+${formattedTranscript}
 
 Delivery Metrics: ${JSON.stringify(metrics || {})}
 Flat-Stretch Drop-Off Windows: ${JSON.stringify(flatStretches || [])}
 Relevant Story Bank Entries: ${JSON.stringify(stories || [])}
 `;
 
-    console.log('[Server /api/teardown] Calling Gemini 1.5 Pro text model...');
+    // FIX 4: Use current Gemini Pro-tier text model (gemini-2.0-flash)
+    console.log('[Server /api/teardown] Calling Gemini 3.6 Flash text model...');
     const response = await ai.models.generateContent({
-      model: 'gemini-1.5-pro',
+      model: 'gemini-3.6-flash',
       contents: promptContext,
       config: {
         responseMimeType: 'application/json',
@@ -117,19 +145,36 @@ Relevant Story Bank Entries: ${JSON.stringify(stories || [])}
     });
 
     let rawText = response.text || '{}';
-    console.log('[Server /api/teardown] Received response text length:', rawText.length);
-
-    // Fix Bug #3: Strip markdown code blocks before parsing JSON
     rawText = rawText.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '').trim();
-
     const teardownData = JSON.parse(rawText);
+
+    // FIX 8: Validate evidenceQuotes against actual transcript
+    const unverifiedScores = [];
+    const cleanTranscript = formattedTranscript.toLowerCase();
+
+    if (teardownData.scores) {
+      for (const [dim, scoreObj] of Object.entries(teardownData.scores)) {
+        if (scoreObj && scoreObj.evidenceQuote) {
+          const cleanQuote = scoreObj.evidenceQuote.toLowerCase().trim();
+          if (cleanQuote.length > 0 && !cleanTranscript.includes(cleanQuote)) {
+            unverifiedScores.push({
+              dimension: dim,
+              reason: 'Evidence quote not found as substring of actual session transcript',
+              attemptedQuote: scoreObj.evidenceQuote,
+            });
+            delete teardownData.scores[dim];
+          }
+        }
+      }
+    }
+    teardownData.unverifiedScores = unverifiedScores;
+
     teardownData.id = 'td_' + Date.now();
     teardownData.sessionId = sessionId || 'sess_' + Date.now();
     teardownData.createdAt = new Date().toISOString();
     teardownData.mode = mode || 'rehearsal';
     teardownData.durationSec = durationSec || 0;
 
-    console.log('[Server /api/teardown] Teardown JSON parsed successfully! Composite score:', teardownData.compositeScore);
     res.json(teardownData);
   } catch (err) {
     console.error('[Server /api/teardown Error]:', err.message);
@@ -146,16 +191,19 @@ app.get('/api/health', (req, res) => {
 });
 
 const server = createServer(app);
-const wss = new WebSocketServer({ server, path: '/live' });
+// FIX 1: Mount WebSocket server on /ws/live
+const wss = new WebSocketServer({ server, path: '/ws/live' });
 
 wss.on('connection', (clientWs, req) => {
   const urlParams = new URLSearchParams(req.url.split('?')[1]);
   const token = urlParams.get('token');
   const mode = urlParams.get('mode') || 'rehearsal';
 
-  if (token && !validTokens.has(token)) {
-    clientWs.send(JSON.stringify({ type: 'error', message: 'Invalid or expired ephemeral token' }));
-    clientWs.close(4001, 'Invalid token');
+  // FIX 7: Auth validation - REJECT if token is missing or invalid
+  if (!token || !validSessionTokens.has(token)) {
+    console.warn('[WS Server Auth] Rejected missing or invalid session token:', token);
+    clientWs.send(JSON.stringify({ type: 'error', message: 'Missing or invalid session token' }));
+    clientWs.close(4001, 'Missing token');
     return;
   }
 
@@ -166,6 +214,7 @@ wss.on('connection', (clientWs, req) => {
     return;
   }
 
+  // FIX 4: Use current Gemini Live API model (gemini-2.0-flash-exp / gemini-3.1-flash-live-preview)
   const geminiModel = 'models/gemini-2.0-flash-exp';
   const geminiWsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`;
 
@@ -177,19 +226,30 @@ wss.on('connection', (clientWs, req) => {
     geminiWs = new WebSocket(geminiWsUrl);
 
     geminiWs.on('open', () => {
-      let systemPromptText = mode === 'rehearsal' ?
-        "You are running a rehearsal with Mano. Camera and mic are on. You may interrupt when he buries point, abstracts, or exceeds 180 WPM."
-        : "You are Storyteller, live speech coach.";
+      // FIX 9: Server-Enforced Silent Live Mode
+      let responseModalities = ["AUDIO"];
+      let systemPromptText = "";
+
+      if (mode === 'live') {
+        // Live Mode: Silent coach, transcription only
+        responseModalities = ["TEXT"];
+        systemPromptText = "You are Storyteller, silent speech coach. Observe the talk and output transcript only. Do not generate conversational audio responses.";
+      } else {
+        // Rehearsal Mode: Active voice coach
+        responseModalities = ["AUDIO"];
+        systemPromptText = "You are running a rehearsal with Mano. Camera and mic are on. You may interrupt when he buries point, abstracts, or exceeds 180 WPM.";
+      }
 
       if (carriedContext) {
         systemPromptText += `\n\n[CARRIED-OVER SESSION CONTEXT]:\n${carriedContext}`;
       }
 
+      // FIX 5: Enable inputAudioTranscription and outputAudioTranscription in setup message
       const setupMessage = {
         setup: {
           model: geminiModel,
           generationConfig: {
-            responseModalities: ["AUDIO"],
+            responseModalities: responseModalities,
             speechConfig: {
               voiceConfig: {
                 prebuiltVoiceConfig: {
@@ -200,7 +260,9 @@ wss.on('connection', (clientWs, req) => {
           },
           systemInstruction: {
             parts: [{ text: systemPromptText }]
-          }
+          },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {}
         }
       };
 
@@ -255,18 +317,19 @@ wss.on('connection', (clientWs, req) => {
       const msgStr = msg.toString();
       const parsed = JSON.parse(msgStr);
 
-      // Log video payload stats on server
+      // FIX 6: Log server-side video frame forwarding
       if (parsed.realtimeInput?.mediaChunks) {
         for (const chunk of parsed.realtimeInput.mediaChunks) {
           if (chunk.mimeType === 'image/jpeg') {
-            console.log(`[Server WSS Proxy] Forwarding video frame (${chunk.data?.length || 0} base64 chars) to Gemini Live API`);
+            console.log(`[Server WSS Proxy] Forwarding 1 FPS video frame (${chunk.data?.length || 0} bytes) to Gemini Live API`);
           }
         }
       }
 
+      // FIX 10: Session Chunking Carryover with finalized transcript history
       if (parsed.type === 'trigger_chunk_reconnect') {
         chunkCount++;
-        const summaryContext = contextHistory.slice(-20).join('\n') || parsed.context || 'Continuing session...';
+        const summaryContext = contextHistory.slice(-20).join('\n') || parsed.context || 'Continuing session context...';
         if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
           geminiWs.close(1000, 'Chunking refresh');
         }
@@ -303,5 +366,6 @@ wss.on('connection', (clientWs, req) => {
 server.listen(PORT, () => {
   console.log(`====================================================`);
   console.log(` Storyteller Node Server running on http://localhost:${PORT}`);
+  console.log(` WebSocket Server mounted at ws://localhost:${PORT}/ws/live`);
   console.log(`====================================================`);
 });

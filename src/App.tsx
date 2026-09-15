@@ -29,6 +29,7 @@ import {
   Clock,
   Camera,
   AlertTriangle,
+  XCircle,
 } from 'lucide-react';
 
 export const App: React.FC = () => {
@@ -43,6 +44,7 @@ export const App: React.FC = () => {
   const [audioLevel, setAudioLevel] = useState<number>(0);
   const [lastFrameSnapshot, setLastFrameSnapshot] = useState<string>('');
   const [cameraError, setCameraError] = useState<string | null>(null);
+  const [teardownError, setTeardownError] = useState<string | null>(null);
 
   // Metrics & transcript logs
   const [metrics, setMetrics] = useState<MetricSnapshot>({
@@ -68,7 +70,6 @@ export const App: React.FC = () => {
   const timerRef = useRef<number | null>(null);
   const metricTimerRef = useRef<number | null>(null);
 
-  // Initialize camera preview on mount
   useEffect(() => {
     getAllTeardowns().catch(console.error);
     initPreviewCamera();
@@ -86,14 +87,14 @@ export const App: React.FC = () => {
         await videoRef.current.play().catch(() => {});
       }
     } catch (err: any) {
-      console.warn('[Camera Init] Camera preview note:', err);
+      console.warn('[Camera Init] Preview camera notice:', err);
       setCameraError(err.message || 'Camera access blocked or webcam in use by another app.');
     }
   };
 
-  // Timer loop when session is active
+  // Timer loop when session is connected
   useEffect(() => {
-    if (isSessionActive) {
+    if (isSessionActive && (status === 'connected' || status === 'connecting' || status === 'chunking')) {
       timerRef.current = window.setInterval(() => {
         setElapsedSeconds((prev) => prev + 1);
       }, 1000);
@@ -118,7 +119,7 @@ export const App: React.FC = () => {
       if (timerRef.current) clearInterval(timerRef.current);
       if (metricTimerRef.current) clearInterval(metricTimerRef.current);
     };
-  }, [isSessionActive]);
+  }, [isSessionActive, status]);
 
   const handleStartSession = async (mode: SessionMode) => {
     setSessionMode(mode);
@@ -128,6 +129,7 @@ export const App: React.FC = () => {
     setElapsedSeconds(0);
     setLastFrameSnapshot('');
     setCameraError(null);
+    setTeardownError(null);
     setIsSessionActive(true);
     metricsEngineRef.current.reset();
 
@@ -141,9 +143,13 @@ export const App: React.FC = () => {
       onStatusChange: (newStatus, msg) => {
         setStatus(newStatus);
         if (msg) setStatusMessage(msg);
+        if (newStatus === 'failed') {
+          setIsSessionActive(false);
+        }
       },
       onTranscript: (speaker, text, isInterim) => {
         const nowSec = elapsedSeconds;
+        // FIX 5: Save ONLY finalized segments
         if (!isInterim) {
           setTranscripts((prev) => [...prev, { speaker, text, timestampSec: nowSec }]);
         }
@@ -171,6 +177,8 @@ export const App: React.FC = () => {
 
   const handleStopSession = async () => {
     setIsSessionActive(false);
+    setTeardownError(null);
+
     if (liveStreamRef.current) {
       liveStreamRef.current.endSession();
       liveStreamRef.current = null;
@@ -180,7 +188,7 @@ export const App: React.FC = () => {
     setStatusMessage('Session completed');
     setIsGeneratingTeardown(true);
 
-    const sessionDuration = elapsedSeconds || 30;
+    const sessionDuration = elapsedSeconds || 1;
 
     try {
       const transcriptEntries: TranscriptEntry[] = transcripts.map((t) => ({
@@ -193,104 +201,33 @@ export const App: React.FC = () => {
 
       const stories: Story[] = await getAllStories();
 
-      let teardownReport: TeardownReport | null = null;
-
-      try {
-        const response = await fetch('/api/teardown', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            sessionId: 'sess_' + Date.now(),
-            durationSec: sessionDuration,
-            mode: sessionMode,
-            transcript: transcripts,
-            metrics,
-            flatStretches,
-            stories,
-          }),
-        });
-
-        if (response.ok) {
-          teardownReport = await response.json();
-        }
-      } catch (e) {
-        console.warn('Backend teardown fallback note:', e);
-      }
-
-      if (!teardownReport || !teardownReport.scores) {
-        const userQuotes = transcripts.filter((t) => t.speaker === 'user');
-        const firstQuote = userQuotes[0]?.text || 'I started my presentation talking about our product launch.';
-        const secondQuote = userQuotes[1]?.text || 'We ran into a major obstacle with scaling.';
-
-        teardownReport = {
-          id: 'td_' + Date.now(),
+      // FIX 8: Request teardown analysis without placeholder text fallbacks
+      const response = await fetch('/api/teardown', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
           sessionId: 'sess_' + Date.now(),
-          createdAt: new Date().toISOString(),
-          mode: sessionMode,
           durationSec: sessionDuration,
-          compositeScore: 78,
-          theOneThing: 'Cut your preamble completely. Start directly with the stakes of the scene rather than setting up background context.',
-          scores: {
-            storyStructure: {
-              score: 75,
-              timestamp: '00:10',
-              evidenceQuote: firstQuote,
-              explanation: 'Good hook opening, but missing a crisp repeatable landing line under 12 words.',
-            },
-            delivery: {
-              score: 80,
-              timestamp: '00:25',
-              evidenceQuote: secondQuote,
-              explanation: 'Pace stayed within the target 120-160 WPM band with minimal filler stacking.',
-            },
-            registerPhrasing: {
-              score: 76,
-              timestamp: '00:40',
-              evidenceQuote: 'In terms of what we did next...',
-              explanation: 'Sounded slightly translated. Native speakers would say "What happened next was..."',
-            },
-            witLightness: {
-              score: 70,
-              timestamp: '00:55',
-              evidenceQuote: 'and then it worked',
-              explanation: 'Dense stretch due for a lighter beat or self-deprecating understatement.',
-            },
-          },
-          structureTeardown: [
-            {
-              storyName: 'Main Session Segment',
-              missingBeats: ['stakes', 'landingLine'],
-              suggestedLandingLine: 'When the server crashed, we rebuilt the engine.',
-              analysis: 'The turn was clear, but the stakes were buried in explanation.',
-            },
-          ],
-          deliveryTeardown: {
-            fillerRatePerMin: metrics.fillerCount30s * 2,
-            last5AvgFillerRate: 3.5,
-            paceRunawayTimestamps: ['00:30'],
-            missedPauseTimestamps: ['00:45'],
-          },
-          registerTeardown: [
-            {
-              originalText: 'In terms of what we did',
-              nativeAlternative1: 'What happened next was',
-              nativeAlternative2: 'Here is how we tackled it',
-              contextAndRegister: 'Removes corporate preamble and creates direct narrative velocity.',
-            },
-          ],
-          lightnessTeardown: {
-            missingBeatTimestamps: ['00:50'],
-            suggestedBitLine: 'Rule of three: We tried plan A, plan B, and then we panicked.',
-          },
-          tomorrowDrill: '10-Minute Preamble Elimination Drill: Set a timer for 10 minutes. Tell your main story 5 times out loud, starting every take directly with dialogue or a specific time/place.',
-        };
+          mode: sessionMode,
+          transcript: transcripts,
+          metrics,
+          flatStretches,
+          stories,
+        }),
+      });
+
+      if (!response.ok) {
+        const errJson = await response.json().catch(() => ({}));
+        throw new Error(errJson.error || `Server returned HTTP ${response.status}`);
       }
 
+      const teardownReport: TeardownReport = await response.json();
       await saveTeardown(teardownReport);
       setActiveTeardown(teardownReport);
       setActiveTab('teardown');
-    } catch (err: unknown) {
-      console.error('Teardown flow note:', err);
+    } catch (err: any) {
+      console.warn('[Teardown Notice]:', err.message);
+      setTeardownError(err.message || 'Failed to generate teardown report.');
     } finally {
       setIsGeneratingTeardown(false);
     }
@@ -379,6 +316,44 @@ export const App: React.FC = () => {
       <main className="flex-1">
         {activeTab === 'dashboard' && (
           <div className="max-w-7xl mx-auto p-6 space-y-6">
+            {/* FIX 2: Render Connection Failure Alert Prominently in Red */}
+            {status === 'failed' && (
+              <div className="bg-rose-950/80 p-4 rounded-2xl border border-rose-600 text-rose-100 text-xs font-bold flex items-center justify-between shadow-2xl animate-pulse">
+                <div className="flex items-center gap-2.5">
+                  <XCircle className="w-5 h-5 text-rose-400 flex-shrink-0" />
+                  <div>
+                    <span className="uppercase tracking-wider font-extrabold text-rose-300 block">Connection Failure</span>
+                    <span>{statusMessage}</span>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setStatus('disconnected')}
+                  className="px-3 py-1 bg-rose-900 hover:bg-rose-800 rounded-lg text-rose-200 border border-rose-500/40"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+
+            {/* FIX 8: Render Teardown Short Transcript Error */}
+            {teardownError && (
+              <div className="bg-amber-950/80 p-4 rounded-2xl border border-amber-600 text-amber-100 text-xs font-bold flex items-center justify-between shadow-2xl">
+                <div className="flex items-center gap-2.5">
+                  <AlertTriangle className="w-5 h-5 text-amber-400 flex-shrink-0" />
+                  <div>
+                    <span className="uppercase tracking-wider font-extrabold text-amber-300 block">Teardown Error (HTTP 400)</span>
+                    <span>{teardownError}</span>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setTeardownError(null)}
+                  className="px-3 py-1 bg-amber-900 hover:bg-amber-800 rounded-lg text-amber-200 border border-amber-500/40"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+
             {/* Header Control Panel */}
             <div className="bg-slate-900/80 backdrop-blur-xl p-6 rounded-3xl border border-slate-800 shadow-2xl flex flex-col md:flex-row items-center justify-between gap-6">
               <div className="space-y-2">
@@ -460,7 +435,6 @@ export const App: React.FC = () => {
                     className="w-full h-full object-cover bg-slate-950"
                   />
 
-                  {/* Camera Error / Permission Callout Overlay */}
                   {cameraError && (
                     <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-md p-6 flex flex-col items-center justify-center text-center space-y-3">
                       <AlertTriangle className="w-10 h-10 text-amber-400 animate-pulse" />
@@ -475,7 +449,6 @@ export const App: React.FC = () => {
                     </div>
                   )}
 
-                  {/* Top Overlay Badges */}
                   <div className="absolute top-4 left-4 flex items-center gap-2.5">
                     <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-black/70 backdrop-blur-md text-xs font-semibold text-slate-200 border border-white/10">
                       <Video className="w-4 h-4 text-cyan-400" />
@@ -487,12 +460,10 @@ export const App: React.FC = () => {
                     </span>
                   </div>
 
-                  {/* Audio Waveform Equalizer */}
                   <div className="absolute bottom-4 left-4">
                     <WaveformVisualizer level={audioLevel} isActive={isSessionActive} />
                   </div>
 
-                  {/* Live 1 FPS Snapshot Thumbnail Box */}
                   {lastFrameSnapshot && (
                     <div className="absolute bottom-4 right-4 bg-black/80 backdrop-blur-md p-1.5 rounded-xl border border-cyan-500/40 shadow-xl flex flex-col items-center">
                       <img src={lastFrameSnapshot} alt="1 FPS Frame" className="w-20 h-14 object-cover rounded-lg border border-white/10" />
