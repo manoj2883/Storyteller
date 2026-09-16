@@ -120,6 +120,10 @@ export class LiveStreamService {
     }
   }
 
+  private mediaRecorder: MediaRecorder | null = null;
+  private recordedChunks: Blob[] = [];
+  private mediaBlobUrl: string | null = null;
+
   private async startMediaCapture(videoElement?: HTMLVideoElement): Promise<void> {
     // 1. Microphone capture (16kHz PCM base64)
     this.audioRecorder = new AudioRecorder((base64Pcm) => {
@@ -161,6 +165,31 @@ export class LiveStreamService {
       }
     });
     await this.videoProcessor.start(videoElement);
+
+    // 3. MediaRecorder for local session replay
+    try {
+      if (videoElement && videoElement.srcObject) {
+        const stream = videoElement.srcObject as MediaStream;
+        if (typeof MediaRecorder !== 'undefined') {
+          const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+            ? 'video/webm;codecs=vp9'
+            : MediaRecorder.isTypeSupported('video/webm')
+            ? 'video/webm'
+            : 'video/mp4';
+
+          this.recordedChunks = [];
+          this.mediaRecorder = new MediaRecorder(stream, { mimeType });
+          this.mediaRecorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) {
+              this.recordedChunks.push(e.data);
+            }
+          };
+          this.mediaRecorder.start(1000);
+        }
+      }
+    } catch (recErr) {
+      console.warn('[LiveStreamService] MediaRecorder setup note:', recErr);
+    }
   }
 
   public getAudioLevel(): number {
@@ -238,8 +267,23 @@ export class LiveStreamService {
     }, 5000);
   }
 
-  public endSession(): void {
+  public endSession(): string | null {
     this.isUserClosed = true;
+
+    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+      try {
+        this.mediaRecorder.stop();
+        if (this.recordedChunks.length > 0) {
+          const mimeType = this.mediaRecorder.mimeType || 'video/webm';
+          const blob = new Blob(this.recordedChunks, { type: mimeType });
+          this.mediaBlobUrl = URL.createObjectURL(blob);
+        }
+      } catch (err) {
+        console.warn('MediaRecorder stop notice:', err);
+      }
+      this.mediaRecorder = null;
+    }
+
     if (this.chunkCheckInterval !== null) {
       clearInterval(this.chunkCheckInterval);
       this.chunkCheckInterval = null;
@@ -265,6 +309,7 @@ export class LiveStreamService {
       this.ws = null;
     }
     this.callbacks.onStatusChange('disconnected', 'Session ended');
+    return this.mediaBlobUrl;
   }
 
   public sendUserTranscript(text: string): void {
